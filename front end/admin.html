@@ -87,6 +87,8 @@
             border-radius: 6px;
         }
     </style>
+    <script src="api-base.js"></script>
+    <script src="api-config.js"></script>
 </head>
 <body>
 
@@ -276,6 +278,7 @@
         event.preventDefault();
         if (confirm("Are you sure you want to log out?")) {
             sessionStorage.removeItem("lemsUser");
+            sessionStorage.removeItem("lemsToken");
             window.location.href = "index.html";
         }
     }

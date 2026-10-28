@@ -5,11 +5,81 @@ const mysql = require("mysql2");
 const cors = require("cors");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL || "http://localhost:8080")
+    .split(",").map((origin) => origin.trim()).filter(Boolean);
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error("Origin is not allowed by CORS"));
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Device-Api-Key"]
+}));
+app.use(express.json({ limit: "1mb" }));
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: { message: "Too many authentication attempts. Please try again later." }
+});
+app.use(["/api/login", "/api/signup", "/api/forgot-password", "/api/reset-password"], authLimiter);
+
+// Protect API routes by default. Login, signup and password-reset routes remain public.
+// Hardware requests use a separate secret and do not accept student-supplied identity claims.
+app.use("/api", (req, res, next) => {
+    const publicPaths = ["/signup", "/login", "/forgot-password", "/reset-password"];
+    if (req.method === "OPTIONS" || publicPaths.includes(req.path)) return next();
+
+    if (req.path === "/kiosk/scan") {
+        const configuredKey = process.env.KIOSK_API_KEY;
+        if (!configuredKey || req.get("X-Device-Api-Key") !== configuredKey) {
+            return res.status(401).json({ message: "Unauthorized kiosk device." });
+        }
+        req.isAuthorizedDevice = true;
+        return next();
+    }
+
+    if (!JWT_SECRET) {
+        return res.status(503).json({ message: "Server authentication is not configured. Set JWT_SECRET." });
+    }
+    const header = req.get("Authorization") || "";
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    if (!match) return res.status(401).json({ message: "Authentication required." });
+
+    try {
+        req.auth = jwt.verify(match[1], JWT_SECRET);
+    } catch (error) {
+        return res.status(401).json({ message: "Session is invalid or expired. Please log in again." });
+    }
+
+    const adminOnly =
+        (req.method === "PUT" && /^\/equipment\/\d+$/.test(req.path)) ||
+        (req.method === "POST" && req.path === "/equipment") ||
+        (req.method === "GET" && ["/complaints", "/transactions"].includes(req.path)) ||
+        (req.method === "PUT" && /^\/complaints\/\d+\/resolve$/.test(req.path)) ||
+        req.path.startsWith("/admin/");
+
+    if (adminOnly && String(req.auth.role).toLowerCase() !== "admin") {
+        return res.status(403).json({ message: "Administrator access required." });
+    }
+
+    const userTransactions = req.path.match(/^\/transactions\/user\/(\d+)$/);
+    if (userTransactions &&
+        Number(userTransactions[1]) !== Number(req.auth.user_id) &&
+        String(req.auth.role).toLowerCase() !== "admin") {
+        return res.status(403).json({ message: "You cannot access another user's transactions." });
+    }
+    next();
+});
 
 // Nodemailer Gmail Setup
 const EMAIL_USER = process.env.EMAIL_USER || "";
@@ -71,23 +141,26 @@ db.connect((err) => {
             db.query("UPDATE equipment SET status = 'AVAILABLE' WHERE available_quantity > 0 AND status NOT IN ('MAINTENANCE', 'LOST')");
         });
 
-        // Auto-create an example admin if no admin exists in users table
-        const checkAdminSql = "SELECT * FROM users WHERE LOWER(role) = 'admin'";
-        db.query(checkAdminSql, (err, rows) => {
-            if (!err && rows.length === 0) {
-                const createAdminSql = `
-                    INSERT INTO users (name, student_id, email, password, role)
-                    VALUES ('Lab Admin', 'A101', 'admin@lems.com', 'admin123', 'admin')
-                `;
-                db.query(createAdminSql, (err) => {
-                    if (!err) {
-                        console.log("Created default Admin user -> ID: A101 | Password: admin123");
-                    } else {
-                        console.error("Could not auto-create admin:", err.message);
-                    }
-                });
-            }
-        });
+        // Optional secure first-admin bootstrap; never create a predictable default password.
+        const bootstrapPassword = process.env.BOOTSTRAP_ADMIN_PASSWORD;
+        const bootstrapId = process.env.BOOTSTRAP_ADMIN_ID;
+        const bootstrapEmail = process.env.BOOTSTRAP_ADMIN_EMAIL;
+        if (bootstrapPassword && bootstrapId && bootstrapEmail) {
+            db.query("SELECT user_id FROM users WHERE LOWER(role) = 'admin' LIMIT 1", (adminErr, admins) => {
+                if (!adminErr && admins.length === 0) {
+                    bcrypt.hash(bootstrapPassword, 12).then((passwordHash) => {
+                        db.query(
+                            "INSERT INTO users (name, student_id, email, password, role) VALUES (?, ?, ?, ?, 'admin')",
+                            [process.env.BOOTSTRAP_ADMIN_NAME || "Lab Admin", bootstrapId, bootstrapEmail, passwordHash],
+                            (insertErr) => {
+                                if (insertErr) console.error("Admin bootstrap failed:", insertErr.message);
+                                else console.log("Bootstrap administrator created from environment configuration.");
+                            }
+                        );
+                    }).catch((hashErr) => console.error("Admin password hashing failed:", hashErr.message));
+                }
+            });
+        }
     }
 });
 
@@ -188,7 +261,11 @@ app.post("/api/signup", (req, res) => {
         });
     }
 
-    const userRole = (role && String(role).toLowerCase() === "admin") ? "admin" : "student";
+    // Public sign-up can only create student accounts. Admins are provisioned separately.
+    const userRole = "student";
+    if (String(password).length < 8) {
+        return res.status(400).json({ message: "Password must be at least 8 characters long." });
+    }
 
     // Check if student_id or email already exists
     const checkSql = "SELECT user_id FROM users WHERE student_id = ? OR email = ?";
@@ -210,15 +287,17 @@ app.post("/api/signup", (req, res) => {
             VALUES (?, ?, ?, ?, ?)
         `;
 
-        db.query(insertSql, [name.trim(), student_id.trim(), email.trim(), password.trim(), userRole], (err, result) => {
-            if (err) {
-                console.error("Signup insert error:", err.message);
-                return res.status(500).json({ error: err.message });
-            }
-
-            res.status(201).json({
-                message: "Account created successfully! You can now log in."
+        bcrypt.hash(password, 12).then((passwordHash) => {
+            db.query(insertSql, [name.trim(), student_id.trim(), email.trim(), passwordHash, userRole], (err) => {
+                if (err) {
+                    console.error("Signup insert error:", err.message);
+                    return res.status(500).json({ message: "Could not create account." });
+                }
+                res.status(201).json({ message: "Account created successfully! You can now log in." });
             });
+        }).catch((hashErr) => {
+            console.error("Signup password hashing error:", hashErr.message);
+            res.status(500).json({ message: "Could not create account." });
         });
     });
 });
@@ -232,27 +311,42 @@ app.post("/api/login", (req, res) => {
         });
     }
 
-    const sql = `
-        SELECT user_id, name, student_id, email, role
-        FROM users
-        WHERE student_id = ? AND password = ?
-    `;
-
-    db.query(sql, [student_id, password], (err, results) => {
-        if (err) {
-            return res.status(500).json({ error: err.message });
-        }
-
+    if (!JWT_SECRET) {
+        return res.status(503).json({ message: "Server authentication is not configured. Set JWT_SECRET." });
+    }
+    const sql = "SELECT user_id, name, student_id, email, role, password FROM users WHERE student_id = ?";
+    db.query(sql, [student_id.trim()], async (err, results) => {
+        if (err) return res.status(500).json({ message: "Login failed." });
         if (results.length === 0) {
-            return res.status(401).json({
-                message: "Invalid student ID or password"
-            });
+            return res.status(401).json({ message: "Invalid student ID or password" });
         }
 
-        res.json({
-            message: "Login successful",
-            user: results[0]
-        });
+        const account = results[0];
+        try {
+            const stored = String(account.password || "");
+            const isHash = /^\$2[aby]\$/.test(stored);
+            const valid = isHash ? await bcrypt.compare(password, stored) : stored === password;
+            if (!valid) return res.status(401).json({ message: "Invalid student ID or password" });
+
+            // Upgrade legacy plaintext passwords on successful login without forcing a reset.
+            if (!isHash) {
+                const upgradedHash = await bcrypt.hash(password, 12);
+                db.query("UPDATE users SET password = ? WHERE user_id = ?", [upgradedHash, account.user_id]);
+            }
+
+            const user = {
+                user_id: account.user_id,
+                name: account.name,
+                student_id: account.student_id,
+                email: account.email,
+                role: account.role
+            };
+            const token = jwt.sign(user, JWT_SECRET, { expiresIn: "2h", issuer: "lems-api" });
+            res.json({ message: "Login successful", user, token, expiresIn: 7200 });
+        } catch (verifyError) {
+            console.error("Login verification error:", verifyError.message);
+            res.status(500).json({ message: "Login failed." });
+        }
     });
 });
 
@@ -272,7 +366,7 @@ app.post("/api/forgot-password", (req, res) => {
         }
 
         if (users.length === 0) {
-            return res.status(404).json({ message: "No account found with this email address." });
+            return res.json({ message: "If an account exists for that email, a password reset link will be sent." });
         }
 
         const user = users[0];
@@ -287,11 +381,8 @@ app.post("/api/forgot-password", (req, res) => {
                 return res.status(500).json({ error: err.message });
             }
 
-            const resetLink = `http://127.0.0.1:8080/reset-password.html?token=${token}`;
-            console.log("\n==========================================");
-            console.log(`PASSWORD RESET LINK FOR ${user.email}:`);
-            console.log(resetLink);
-            console.log("==========================================\n");
+            const frontendUrl = (process.env.FRONTEND_URL || "http://localhost:8080").split(",")[0].trim().replace(/\/$/, "");
+            const resetLink = `${frontendUrl}/reset-password.html?token=${token}`;
 
             // Send real email if Gmail credentials are provided
             if (transporter) {
@@ -328,8 +419,7 @@ app.post("/api/forgot-password", (req, res) => {
             }
 
             res.json({
-                message: "Password reset link generated! Check your email inbox.",
-                resetLink: resetLink
+                message: "If an account exists for that email, a password reset link will be sent."
             });
         });
     });
@@ -357,19 +447,27 @@ app.post("/api/reset-password", (req, res) => {
         const user = users[0];
 
         // Expiration check in JS to prevent MySQL timezone mismatches
-        if (user.reset_token_expires && new Date(user.reset_token_expires).getTime() < Date.now()) {
+        if (!user.reset_token_expires || new Date(user.reset_token_expires).getTime() <= Date.now()) {
             return res.status(400).json({ message: "Password reset link has expired. Please request a new one." });
         }
 
+        if (String(new_password).length < 8) {
+            return res.status(400).json({ message: "New password must be at least 8 characters long." });
+        }
         const userId = user.user_id;
-        const updateSql = "UPDATE users SET password = ?, reset_token = NULL, reset_token_expires = NULL WHERE user_id = ?";
-        db.query(updateSql, [new_password.trim(), userId], (err) => {
+        bcrypt.hash(new_password, 12).then((passwordHash) => {
+            const updateSql = "UPDATE users SET password = ?, reset_token = NULL, reset_token_expires = NULL WHERE user_id = ?";
+            db.query(updateSql, [passwordHash, userId], (err) => {
             if (err) {
                 console.error("Password update error:", err);
                 return res.status(500).json({ error: err.message });
             }
 
-            res.json({ message: "Password reset successful! You can now log in with your new password." });
+                res.json({ message: "Password reset successful! You can now log in with your new password." });
+            });
+        }).catch((hashErr) => {
+            console.error("Password reset hashing error:", hashErr.message);
+            res.status(500).json({ message: "Could not reset password." });
         });
     });
 });
@@ -377,7 +475,8 @@ app.post("/api/reset-password", (req, res) => {
 // Submit Complaint / Maintenance Request API (Student Side)
 app.post("/api/complaints", (req, res) => {
     console.log("POST /api/complaints received body:", req.body);
-    const { user_id, equipment_id, issue_description } = req.body;
+    const { equipment_id, issue_description } = req.body;
+    const user_id = req.auth.user_id;
 
     if (!user_id || !equipment_id || !issue_description) {
         return res.status(400).json({ message: "User ID, Equipment ID, and Issue Description are required." });
@@ -460,7 +559,8 @@ app.put("/api/complaints/:id/resolve", (req, res) => {
 
 // Checkout equipment API
 app.post("/api/checkout", (req, res) => {
-    const { user_id, equipment_id } = req.body;
+    const { equipment_id } = req.body;
+    const user_id = req.auth.user_id;
 
     if (!user_id || !equipment_id) {
         return res.status(400).json({
@@ -577,12 +677,13 @@ app.post("/api/return", (req, res) => {
         SELECT transaction_id
         FROM transactions
         WHERE equipment_id = ?
+          AND user_id = ?
           AND status = 'ACTIVE'
         ORDER BY checkout_time DESC
         LIMIT 1
     `;
 
-    db.query(sql, [equipment_id], (err, results) => {
+    db.query(sql, [equipment_id, req.auth.user_id], (err, results) => {
         if (err) {
             return res.status(500).json({ error: err.message });
         }

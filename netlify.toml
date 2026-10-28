@@ -1,0 +1,9 @@
+[build]
+  command = "node scripts/generate-api-config.js"
+  publish = "front end"
+
+[[headers]]
+  for = "/*.html"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
